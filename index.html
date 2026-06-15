@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Jakarta Air Quality &mdash; hex-grid forecast</title>
+
+  <!-- Leaflet (map) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Status banner (text + style set from meta.model_status by app.js) -->
+  <div id="status-banner" class="banner"></div>
+
+  <header id="topbar">
+    <div class="brand">
+      <h1>Jakarta Air Quality</h1>
+      <span class="subtitle">Morning AQI forecast &middot; H3 hex grid &middot; <span id="res-label">r7</span></span>
+    </div>
+    <button id="about-btn" class="ghost-btn" type="button">About</button>
+  </header>
+
+  <main id="layout">
+    <div id="map"></div>
+
+    <aside id="sidebar">
+      <!-- 1 - location -->
+      <section class="card" id="location-card">
+        <h2><span class="step-n">1</span> Choose a location</h2>
+        <div class="mode-row">
+          <button id="mode-current" class="mode-btn active" type="button">My location</button>
+          <button id="mode-other" class="mode-btn" type="button">Lat / lon</button>
+        </div>
+
+        <div id="panel-current" class="mode-panel">
+          <button id="locate-btn" class="primary" type="button">Locate me</button>
+          <p class="hint">Your browser will ask permission to share your location.</p>
+        </div>
+
+        <div id="panel-other" class="mode-panel hidden">
+          <div class="latlon-row">
+            <label>Lat <input id="lat-input" type="number" step="0.0001" value="-6.1751" /></label>
+            <label>Lon <input id="lon-input" type="number" step="0.0001" value="106.8650" /></label>
+          </div>
+          <button id="go-btn" class="primary" type="button">Show this location</button>
+          <p class="hint">&hellip; or click anywhere on the map.</p>
+        </div>
+      </section>
+
+      <!-- 2 - result -->
+      <section class="card hidden" id="result-card">
+        <h2><span class="step-n">2</span> Predicted AQI</h2>
+        <div id="result-meta" class="result-meta"></div>
+
+        <!-- live readout -->
+        <div id="aqi-readout" class="hidden">
+          <div id="aqi-value">&mdash;</div>
+          <div id="aqi-badge" class="badge">&mdash;</div>
+        </div>
+
+        <!-- pending / coming-soon readout -->
+        <div id="aqi-pending" class="pending-box hidden">
+          <div class="pending-title">Awaiting model output</div>
+          <p class="pending-text" id="pending-text"></p>
+        </div>
+
+        <!-- forecast (live only) -->
+        <div id="forecast-section" class="hidden">
+          <h3 class="chart-title">Next 6 hours &middot; 3-hour steps</h3>
+          <canvas id="forecast-chart" height="170"></canvas>
+          <div id="step-badges" class="step-badges"></div>
+        </div>
+      </section>
+
+      <!-- 3 - legend -->
+      <section class="card" id="legend-card">
+        <h2>Air-quality scale (ISPU)</h2>
+        <ul id="legend-list" class="legend"></ul>
+      </section>
+    </aside>
+  </main>
+
+  <!-- About overlay -->
+  <div id="about-overlay" class="overlay hidden">
+    <div class="overlay-card">
+      <button id="about-close" class="overlay-close" type="button" aria-label="Close">&times;</button>
+      <h2>About this map</h2>
+      <p>
+        A research forecast of <strong>morning</strong> air quality across Jakarta, predicted on a
+        hexagonal <a href="https://h3geo.org/" target="_blank" rel="noopener">H3</a> grid
+        (resolution <strong>r7</strong>, ~1.4&nbsp;km cells) covering mainland DKI Jakarta. A
+        spatio-temporal graph neural network (ST-GCN) forecasts the Indonesian air-quality index
+        (ISPU) at a pre-dawn anchor and the next 6 hours in 3-hour steps. Pick a location and the
+        page resolves it to its hex cell and shows that cell's forecast.
+      </p>
+      <h3>Important limitations</h3>
+      <ul id="about-disclaimers" class="about-list"></ul>
+      <p class="about-foot">
+        Built from the project's static prediction output &mdash; no live model server. Map tiles
+        &copy; OpenStreetMap contributors.
+      </p>
+    </div>
+  </div>
+
+  <footer id="footer-note"></footer>
+
+  <!-- libraries -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <!-- h3-js v4 (UMD global `h3`). v4 API only: latLngToCell, NOT v3 geoToH3. -->
+  <script src="https://cdn.jsdelivr.net/npm/h3-js@4.1.0/dist/h3-js.umd.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
