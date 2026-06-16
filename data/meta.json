@@ -1,8 +1,8 @@
 {
   "resolution": 7,
-  "model_status": "pending_retrain",
-  "model_note": "Model output is being re-trained (pm25_conc target). Forecast values are not yet published - the map and location tools work, but per-cell values show 'awaiting model output'.",
-  "anchor_ts": null,
+  "model_status": "live",
+  "model_note": "Forecast from the trained AST-GCN model (morning window, 3-hour steps).",
+  "anchor_ts": "2025-02-28 04:00:00",
   "horizons_h": [
     0,
     3,
@@ -10,7 +10,7 @@
   ],
   "has_plus_9h": false,
   "n_cells": 290,
-  "n_forecast_cells": 0,
+  "n_forecast_cells": 290,
   "legend": [
     {
       "category": "BAIK",
