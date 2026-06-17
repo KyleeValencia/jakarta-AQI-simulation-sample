@@ -67,7 +67,7 @@
 
         <!-- forecast (live only) -->
         <div id="forecast-section" class="hidden">
-          <h3 class="chart-title">Next 6 hours &middot; 3-hour steps</h3>
+          <h3 id="chart-title" class="chart-title">Forecast</h3>
           <canvas id="forecast-chart" height="170"></canvas>
           <div id="step-badges" class="step-badges"></div>
         </div>
@@ -87,12 +87,15 @@
       <button id="about-close" class="overlay-close" type="button" aria-label="Close">&times;</button>
       <h2>About this map</h2>
       <p>
-        A research forecast of <strong>morning</strong> air quality across Jakarta, predicted on a
-        hexagonal <a href="https://h3geo.org/" target="_blank" rel="noopener">H3</a> grid
-        (resolution <strong>r7</strong>, ~1.4&nbsp;km cells) covering mainland DKI Jakarta. A
-        spatio-temporal graph neural network (ST-GCN) forecasts the Indonesian air-quality index
-        (ISPU) at a pre-dawn anchor and the next 6 hours in 3-hour steps. Pick a location and the
-        page resolves it to its hex cell and shows that cell's forecast.
+        A research forecast of air quality across Jakarta over the <strong>full diurnal cycle</strong>,
+        predicted on a hexagonal <a href="https://h3geo.org/" target="_blank" rel="noopener">H3</a> grid
+        (resolution <strong>r7</strong>, ~1.4&nbsp;km cells) covering mainland DKI Jakarta. An attention
+        spatio-temporal graph neural network (AST-GCN) forecasts the Indonesian air-quality index (ISPU);
+        the page anchors at the fixed clock slot nearest your current <strong>WIB</strong> time and shows
+        that point plus the next three steps. The within-day shape is a <strong>modeled, representative
+        pattern</strong> (CAMS-derived, calibrated to the daily peak) &mdash; not a live measurement, and
+        the underlying day is the latest modeled date, not today. Pick a location and the page resolves it
+        to its hex cell and shows that cell's forecast.
       </p>
       <h3>Important limitations</h3>
       <ul id="about-disclaimers" class="about-list"></ul>

@@ -29,6 +29,7 @@ const state = {
   locationMarker: null,
   chart: null,
   currentSlot: null, // the diurnal clock slot nearest "now" (null for legacy flat data)
+  selected: null, // { h3id, lat, lng } of the chosen cell, so the clock tick can re-render it
   mode: "current", // "current" | "other"
 };
 
@@ -54,7 +55,12 @@ const colorFor = (value) => legendEntryFor(value).color;
 // forecast style). The data's slots are WIB clock hours, so "now" is WIB too.
 // ---------------------------------------------------------------------------
 const pad2 = (n) => String(n).padStart(2, "0");
-const nowHourWIB = () => (new Date().getUTCHours() + 7) % 24; // WIB = UTC+7
+// A Date whose UTC fields read as WIB wall-clock (WIB = UTC+7), so the date and
+// hour are correct no matter what timezone the viewer's browser is in.
+const nowWIB = () => new Date(Date.now() + 7 * 3600 * 1000);
+const nowHourWIB = () => nowWIB().getUTCHours();
+const wibDateStr = () => { const d = nowWIB(); return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`; };
+const wibClockStr = () => { const d = nowWIB(); return `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`; };
 const circDist = (a, b) => { const d = Math.abs(a - b) % 24; return Math.min(d, 24 - d); };
 
 function nearestSlot(hour) {
@@ -178,6 +184,7 @@ function selectByLatLng(lat, lng) {
 }
 
 function selectByCell(h3id, lat, lng) {
+  state.selected = { h3id, lat, lng };
   show("result-card", true);
   const layer = state.h3ToLayer.get(h3id) || null;
   const onGrid = layer !== null;
@@ -231,28 +238,26 @@ function selectByCell(h3id, lat, lng) {
 // ---------------------------------------------------------------------------
 const stepLabel = (offsetH) => (offsetH === 0 ? "Now" : `+${offsetH}h`);
 
-// Absolute time of the current slot's anchor: new shape = anchor_date + slot hour;
-// legacy = meta.anchor_ts. Returns null if neither is available.
-function stepBase() {
-  if (state.meta.anchor_date && state.currentSlot != null) {
-    const d = new Date(String(state.meta.anchor_date) + "T00:00:00");
-    if (!isNaN(d.getTime())) return new Date(d.getTime() + state.currentSlot * 3600 * 1000);
-  }
+// WIB clock time of a forecast point. Slots are whole WIB clock hours and offsets
+// are whole hours, so the wall-clock is just (slot + offset) mod 24 -- computed in
+// WIB directly, independent of the viewer's browser timezone.
+function stepClock(offsetH) {
+  if (state.currentSlot != null) return pad2((state.currentSlot + offsetH) % 24) + ":00";
+  // legacy flat data (single anchor): derive the hour from anchor_ts if present.
   if (state.meta.anchor_ts) {
     const d = new Date(String(state.meta.anchor_ts).replace(" ", "T"));
-    if (!isNaN(d.getTime())) return d;
+    if (!isNaN(d.getTime())) return pad2((d.getHours() + offsetH) % 24) + ":00";
   }
-  return null;
-}
-
-function stepClock(offsetH) {
-  const base = stepBase();
-  if (!base) return "";
-  const t = new Date(base.getTime() + offsetH * 3600 * 1000);
-  return t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  return "";
 }
 
 function renderChart(series) {
+  // Heading reflects the actual step size + horizon span from the data (not hardcoded).
+  const step = series.length > 1 ? series[1].offset_h - series[0].offset_h : 0;
+  const span = series.length ? series[series.length - 1].offset_h : 0;
+  const titleEl = document.getElementById("chart-title");
+  if (titleEl) titleEl.textContent = step ? `Next ${span} hours · ${step}-hour steps` : "Forecast";
+
   const labels = series.map((s) => {
     const clk = stepClock(s.offset_h);
     return clk ? `${stepLabel(s.offset_h)}\n${clk}` : stepLabel(s.offset_h);
@@ -339,10 +344,16 @@ function renderBanner() {
     b.innerHTML = `<strong>PREVIEW</strong> &mdash; ${state.meta.model_note}`;
   } else {
     b.className = "banner banner-live";
-    const anchorTxt = state.meta.anchor_date
-      ? `${state.meta.anchor_date}${state.currentSlot != null ? " " + pad2(state.currentSlot) + ":00" : ""}`
-      : (state.meta.anchor_ts || "—");
-    b.innerHTML = `Live forecast &middot; anchor ${anchorTxt} (WIB)`;
+    if (state.currentSlot != null) {
+      // Driven by the current WIB clock: today's date + live WIB time. The values are
+      // a modeled representative diurnal pattern, so we label it honestly (not "live").
+      b.innerHTML =
+        `Modeled diurnal pattern &middot; ${wibDateStr()} ${wibClockStr()} WIB ` +
+        `&middot; representative day, not a live measurement`;
+    } else {
+      const anchorTxt = state.meta.anchor_ts || state.meta.anchor_date || "—";
+      b.innerHTML = `Modeled forecast &middot; anchor ${anchorTxt} (WIB)`;
+    }
   }
 }
 
@@ -362,6 +373,22 @@ function setMode(mode) {
   document.getElementById("mode-other").classList.toggle("active", mode === "other");
   show("panel-current", mode === "current");
   show("panel-other", mode === "other");
+}
+
+// Re-evaluate the WIB clock on a timer: keep the banner's "now" current, and when the
+// nearest slot rolls over (every few hours) recolor the grid + re-render the selected
+// cell, so the map follows the time of day on its own without a reload.
+function tickClock() {
+  if (isPending()) return;
+  if (!(state.meta && state.meta.slot_hours && state.meta.slot_hours.length)) return;
+  const s = nearestSlot(nowHourWIB());
+  const slotChanged = s !== state.currentSlot;
+  state.currentSlot = s;
+  renderBanner();
+  if (slotChanged) {
+    if (state.geoLayer) state.geoLayer.setStyle(styleForFeature); // hexes follow the new slot
+    if (state.selected) selectByCell(state.selected.h3id, state.selected.lat, state.selected.lng);
+  }
 }
 
 function wireControls() {
@@ -453,6 +480,7 @@ async function boot() {
   renderAbout();
   wireControls();
   setMode("current");
+  setInterval(tickClock, 60 * 1000); // follow the WIB clock without a reload
 }
 
 boot().catch((e) => {
