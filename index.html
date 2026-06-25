@@ -25,6 +25,24 @@
     <div id="map"></div>
 
     <aside id="sidebar">
+      <!-- 0 - forecast date (today's live climatology, or a date from the archive) -->
+      <section class="card" id="date-card">
+        <h2>Forecast date</h2>
+        <div class="mode-row">
+          <button id="date-mode-live" class="mode-btn active" type="button">Today (live)</button>
+          <button id="date-mode-archive" class="mode-btn" type="button">Pick a date</button>
+        </div>
+
+        <div id="panel-date-live" class="mode-panel">
+          <p class="hint" id="live-date-hint"></p>
+        </div>
+
+        <div id="panel-date-archive" class="mode-panel hidden">
+          <input id="date-input" type="date" />
+          <p class="hint" id="date-hint"></p>
+        </div>
+      </section>
+
       <!-- 1 - location -->
       <section class="card" id="location-card">
         <h2><span class="step-n">1</span> Choose a location</h2>

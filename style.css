@@ -147,6 +147,18 @@ button.primary:hover { filter: brightness(1.05); }
   border-radius: 6px;
 }
 
+#date-input {
+  width: 100%;
+  padding: 8px;
+  font-size: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin-bottom: 6px;
+  font-family: inherit;
+  color: var(--ink);
+  background: #fff;
+}
+
 /* ---- result ---- */
 .result-meta { font-size: 12px; color: var(--muted); margin-bottom: 8px; word-break: break-all; }
 .result-meta .warn { color: #b4541a; }

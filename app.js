@@ -15,12 +15,21 @@
  *   "pending_retrain" - coming-soon: map + location tools work, but per-cell values
  *                       show an honest "awaiting model output" message.
  *   "live"            - real forecasts shown (value, category, diurnal chart).
+ *
+ * Date picker (archive):
+ *   meta.archive = { start_date, end_date, path_pattern } tells the page the bounds and
+ *   filename pattern of a separate set of already-built per-date forecast files
+ *   (data/forecast_r{R}_{date}.json, same contract as the default forecast file). The
+ *   "Today (live)" / "Pick a date" toggle swaps state.forecast between the live file
+ *   loaded at boot and a lazily-fetched, cached archive date. Missing dates (some days
+ *   in the archive may not exist) are handled with an inline message, not a crash.
  */
 
 const JAKARTA_CENTER = [-6.2, 106.84];
 const state = {
   meta: null,
   forecast: null,
+  liveForecast: null, // the "today" forecast loaded at boot, kept so we can revert to it
   resolution: 7,
   h3ToLayer: new Map(),
   geoLayer: null,
@@ -31,6 +40,16 @@ const state = {
   currentSlot: null, // the diurnal clock slot nearest "now" (null for legacy flat data)
   selected: null, // { h3id, lat, lng } of the chosen cell, so the clock tick can re-render it
   mode: "current", // "current" | "other"
+  dateMode: "live", // "live" | "archive"
+  archiveDate: null, // "YYYY-MM-DD" currently shown, when dateMode === "archive"
+  archiveCache: new Map(), // date -> forecast object, or null if known-missing
+};
+
+// Fallback if meta.json predates the archive feature; meta.archive (when present) wins.
+const DEFAULT_ARCHIVE = {
+  start_date: "2024-02-02",
+  end_date: "2025-02-28",
+  path_pattern: "data/forecast_r{res}_{date}.json",
 };
 
 const isPending = () => !state.meta || state.meta.model_status === "pending_retrain";
@@ -63,11 +82,15 @@ const wibDateStr = () => { const d = nowWIB(); return `${d.getUTCFullYear()}-${p
 const wibClockStr = () => { const d = nowWIB(); return `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`; };
 const circDist = (a, b) => { const d = Math.abs(a - b) % 24; return Math.min(d, 24 - d); };
 
-function nearestSlot(hour) {
-  const slots = (state.meta && state.meta.slot_hours) || [];
-  if (!slots.length) return null;
-  return slots.reduce((best, s) => (circDist(s, hour) < circDist(best, hour) ? s : best), slots[0]);
+function nearestSlot(hour, slots) {
+  const list = slots || (state.meta && state.meta.slot_hours) || [];
+  if (!list.length) return null;
+  return list.reduce((best, s) => (circDist(s, hour) < circDist(best, hour) ? s : best), list[0]);
 }
+
+// The slot_hours that govern the CURRENTLY LOADED forecast (archive dates carry their
+// own slot_hours; fall back to meta for the live/default file or legacy data).
+const activeSlotHours = () => (state.forecast && state.forecast.slot_hours) || (state.meta && state.meta.slot_hours) || [];
 
 // The current-slot series for a cell. Accepts the slot-keyed shape
 // { slot_h: [series] } and the legacy flat [series] (returned as-is).
@@ -105,7 +128,7 @@ function styleForFeature(feature) {
   const idx = series ? series[0].value : null;
   return {
     fillColor: idx === null ? state.meta.no_data_color : series[0].colour || colorFor(idx),
-    fillOpacity: 0.6,
+    fillOpacity: 0.4,
     color: "#5b6573",
     weight: 0.3,
   };
@@ -170,7 +193,7 @@ function placeMarker(lat, lng) {
 function highlight(layer) {
   if (state.selectedLayer && state.geoLayer) state.geoLayer.resetStyle(state.selectedLayer);
   if (layer) {
-    layer.setStyle({ color: "#111", weight: 2.5, fillOpacity: isPending() ? 0.45 : 0.8 });
+    layer.setStyle({ color: "#111", weight: 2.5, fillOpacity: isPending() ? 0.4 : 0.65 });
     layer.bringToFront();
   }
   state.selectedLayer = layer;
@@ -192,8 +215,11 @@ function selectByCell(h3id, lat, lng) {
   if (layer) state.map.panTo(layer.getBounds().getCenter());
 
   const coordTxt = lat != null ? `${lat.toFixed(4)}, ${lng.toFixed(4)}` : "";
+  const dateTxt = state.dateMode === "archive" && state.archiveDate
+    ? `<br>Archived date: ${state.archiveDate}`
+    : "";
   document.getElementById("result-meta").innerHTML =
-    `Cell <code>${h3id}</code>${coordTxt ? "<br>" + coordTxt : ""}` +
+    `Cell <code>${h3id}</code>${coordTxt ? "<br>" + coordTxt : ""}${dateTxt}` +
     (onGrid ? "" : `<br><span class="warn">Outside the Jakarta study grid.</span>`);
 
   // --- PENDING (coming-soon) state ---
@@ -344,7 +370,14 @@ function renderBanner() {
     b.innerHTML = `<strong>PREVIEW</strong> &mdash; ${state.meta.model_note}`;
   } else {
     b.className = "banner banner-live";
-    if (state.currentSlot != null) {
+    if (state.dateMode === "archive" && state.archiveDate) {
+      // Archived date: the diurnal SHAPE still follows the live WIB clock (the slot
+      // nearest "now"), but the underlying day is the picked archive date, not today.
+      const clk = state.currentSlot != null ? ` &middot; ${wibClockStr()} WIB` : "";
+      b.innerHTML =
+        `<strong>ARCHIVE</strong> &middot; modeled diurnal pattern for ${state.archiveDate}${clk} ` +
+        `&middot; representative day, not a live measurement`;
+    } else if (state.currentSlot != null) {
       // Driven by the current WIB clock: today's date + live WIB time. The values are
       // a modeled representative diurnal pattern, so we label it honestly (not "live").
       b.innerHTML =
@@ -380,8 +413,9 @@ function setMode(mode) {
 // cell, so the map follows the time of day on its own without a reload.
 function tickClock() {
   if (isPending()) return;
-  if (!(state.meta && state.meta.slot_hours && state.meta.slot_hours.length)) return;
-  const s = nearestSlot(nowHourWIB());
+  const slots = activeSlotHours();
+  if (!slots.length) return;
+  const s = nearestSlot(nowHourWIB(), slots);
   const slotChanged = s !== state.currentSlot;
   state.currentSlot = s;
   renderBanner();
@@ -391,7 +425,76 @@ function tickClock() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Date picker (archive): swap state.forecast between the live "today" file and
+// an already-built per-date file from the archive. Lazily fetched + cached;
+// missing dates degrade to an inline message, never a crash.
+// ---------------------------------------------------------------------------
+const archiveConfig = () => (state.meta && state.meta.archive) || DEFAULT_ARCHIVE;
+const archivePath = (dateStr) =>
+  archiveConfig().path_pattern.replace("{res}", state.resolution).replace("{date}", dateStr);
+
+async function loadArchiveDate(dateStr) {
+  const cache = state.archiveCache;
+  if (cache.has(dateStr)) return cache.get(dateStr); // a forecast object, or null = known-missing
+  try {
+    const res = await fetch(archivePath(dateStr));
+    if (!res.ok) { cache.set(dateStr, null); return null; }
+    const data = await res.json();
+    cache.set(dateStr, data);
+    return data;
+  } catch (e) {
+    cache.set(dateStr, null);
+    return null;
+  }
+}
+
+// Re-derive everything that depends on "which forecast is loaded": the clock slot,
+// the grid colouring, the banner, and the currently-selected cell's readout.
+function refreshAfterForecastChange() {
+  const slots = activeSlotHours();
+  state.currentSlot = slots.length ? nearestSlot(nowHourWIB(), slots) : null;
+  if (state.geoLayer) state.geoLayer.setStyle(styleForFeature);
+  renderBanner();
+  if (state.selected) selectByCell(state.selected.h3id, state.selected.lat, state.selected.lng);
+}
+
+async function onArchiveDateChange(dateStr) {
+  state.archiveDate = dateStr;
+  const hint = document.getElementById("date-hint");
+  hint.classList.remove("warn");
+  hint.textContent = "Loading…";
+  const data = await loadArchiveDate(dateStr);
+  if (!data) {
+    hint.textContent = `No forecast saved for ${dateStr} — try a nearby date.`;
+    hint.classList.add("warn");
+    return; // keep showing whatever was loaded before (don't blank the map on a miss)
+  }
+  state.forecast = data;
+  hint.textContent = `Showing the modeled climatology for ${dateStr}.`;
+  refreshAfterForecastChange();
+}
+
+function setDateMode(mode) {
+  state.dateMode = mode;
+  document.getElementById("date-mode-live").classList.toggle("active", mode === "live");
+  document.getElementById("date-mode-archive").classList.toggle("active", mode === "archive");
+  show("panel-date-live", mode === "live");
+  show("panel-date-archive", mode === "archive");
+  if (mode === "live") {
+    state.forecast = state.liveForecast;
+    refreshAfterForecastChange();
+  } else {
+    const input = document.getElementById("date-input");
+    if (input.value) onArchiveDateChange(input.value);
+  }
+}
+
 function wireControls() {
+  document.getElementById("date-mode-live").addEventListener("click", () => setDateMode("live"));
+  document.getElementById("date-mode-archive").addEventListener("click", () => setDateMode("archive"));
+  document.getElementById("date-input").addEventListener("change", (e) => onArchiveDateChange(e.target.value));
+
   document.getElementById("mode-current").addEventListener("click", () => setMode("current"));
   document.getElementById("mode-other").addEventListener("click", () => setMode("other"));
 
@@ -469,8 +572,17 @@ async function boot() {
     fetch(`data/hexes_r${meta.resolution}.geojson`).then((r) => r.json()),
   ]);
   state.forecast = forecast;
+  state.liveForecast = forecast; // keep a handle so "Today (live)" can revert to it
   state.currentSlot = (meta.slot_hours && meta.slot_hours.length) ? nearestSlot(nowHourWIB()) : null;
   document.getElementById("res-label").textContent = "r" + meta.resolution;
+
+  const arc = archiveConfig();
+  const dateInput = document.getElementById("date-input");
+  dateInput.min = arc.start_date;
+  dateInput.max = arc.end_date;
+  dateInput.value = arc.end_date; // default to the most recent archived date
+  document.getElementById("live-date-hint").textContent =
+    `Showing today's live modeled forecast. Archive available ${arc.start_date} → ${arc.end_date}.`;
 
   initMap();
   addGeoLayer(geojson);

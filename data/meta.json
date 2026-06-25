@@ -2,7 +2,12 @@
   "resolution": 7,
   "model_status": "live",
   "model_note": "Modeled climatology from the trained AST-GCN forecast: the typical air for today's date (season + weekday/weekend) by time of day, refreshed daily - not a live measurement.",
-  "anchor_date": "2026-06-17",
+  "anchor_date": "2026-06-19",
+  "archive": {
+    "start_date": "2024-02-02",
+    "end_date": "2025-02-28",
+    "path_pattern": "data/forecast_r{res}_{date}.json"
+  },
   "slot_hours": [
     0,
     4,

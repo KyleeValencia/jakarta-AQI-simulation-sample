@@ -100,6 +100,16 @@ DISCLAIMERS = [
     "measured value. A real deployment must state this.",
 ]
 
+# Date-picker archive of historical per-date forecasts (data/forecast_r{res}_{date}.json,
+# already produced by a separate backtest pipeline — this build script does not generate
+# them). Single source of truth for the front-end's date-picker bounds + file pattern; if
+# the archive range changes, update only here.
+ARCHIVE_CONFIG = {
+    "start_date": "2024-02-02",
+    "end_date": "2025-02-28",
+    "path_pattern": "data/forecast_r{res}_{date}.json",
+}
+
 PENDING_NOTE = (
     "Model output is being re-trained (pm25_conc target). Forecast values are not yet "
     "published - the map and location tools work, but per-cell values show "
@@ -256,6 +266,7 @@ def main() -> None:
         "model_status": model_status,
         "model_note": model_note,
         "anchor_date": anchor,
+        "archive": ARCHIVE_CONFIG,
         "slot_hours": slot_hours,
         "horizons_h": horizons,
         "n_horizons": len(horizons),
