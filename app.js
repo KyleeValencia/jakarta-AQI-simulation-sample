@@ -434,13 +434,30 @@ const archiveConfig = () => (state.meta && state.meta.archive) || DEFAULT_ARCHIV
 const archivePath = (dateStr) =>
   archiveConfig().path_pattern.replace("{res}", state.resolution).replace("{date}", dateStr);
 
+// The backtest pipeline that produces the archive files (data/forecast_r{res}_{date}.json)
+// sometimes emits the BARE cell map at the top level -- { h3_id: { slot_h: [series] } } --
+// with no { model_status, anchor_date, slot_hours, horizons_h, cells } wrapper. cellsMap()
+// only ever looks at state.forecast.cells, so an unwrapped file silently looks empty (every
+// cell shows "Outside coverage"). Normalize both shapes here, the same way build_web_data.py's
+// load_nb8_forecast() derives slot_hours/horizons_h from the raw cell data when meta is absent.
+function normalizeArchiveForecast(raw, dateStr) {
+  if (raw && typeof raw === "object" && raw.cells) return raw; // already wrapped - leave as-is
+  const cells = raw || {};
+  const firstCell = cells[Object.keys(cells)[0]] || {};
+  const slot_hours = Object.keys(firstCell).map(Number).sort((a, b) => a - b);
+  const firstSlot = firstCell[Object.keys(firstCell)[0]] || [];
+  const horizons_h = firstSlot.map((p) => p.offset_h);
+  return { model_status: "live", anchor_date: dateStr, slot_hours, horizons_h, cells };
+}
+
 async function loadArchiveDate(dateStr) {
   const cache = state.archiveCache;
   if (cache.has(dateStr)) return cache.get(dateStr); // a forecast object, or null = known-missing
   try {
     const res = await fetch(archivePath(dateStr));
     if (!res.ok) { cache.set(dateStr, null); return null; }
-    const data = await res.json();
+    const raw = await res.json();
+    const data = normalizeArchiveForecast(raw, dateStr);
     cache.set(dateStr, data);
     return data;
   } catch (e) {
