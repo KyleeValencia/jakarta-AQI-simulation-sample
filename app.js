@@ -4,32 +4,29 @@
  *   meta.json           - resolution, model_status, anchor_date, slot_hours, horizons, legend, disclaimers
  *   forecast_r{R}.json  - { model_status, anchor_date, slot_hours, horizons_h,
  *                           cells: { h3_id: { slot_h: [ {offset_h, value, category, colour} ] } } }
- *                         (slot_h = a fixed clock slot; the page shows the slot nearest "now"
- *                          in WIB. A legacy flat { h3_id: [ series ] } is still accepted.)
+ *                         (slot_h = a fixed clock slot; historical views use one point per
+ *                          slot to show the full diurnal pattern. A legacy flat shape is still accepted.)
  *   hexes_r{R}.geojson  - hex-cell polygons (+ h3_id, center_lat/lon)
  *
  * AQI scale, category and colour all come from meta (exported from aqi_models.physics),
  * so nothing about the scale is hardcoded here.
  *
- * Two states, driven by meta.model_status:
- *   "pending_retrain" - coming-soon: map + location tools work, but per-cell values
- *                       show an honest "awaiting model output" message.
- *   "live"            - real forecasts shown (value, category, diurnal chart).
+ * Historical-first flow:
+ *   The page starts with map + location tools only. Forecast values are loaded
+ *   only after the user chooses a historical date and presses "Show date".
  *
  * Date picker (archive):
- *   meta.archive = { start_date, end_date, path_pattern } tells the page the bounds and
- *   filename pattern of a separate set of already-built per-date forecast files
- *   (data/forecast_r{R}_{date}.json, same contract as the default forecast file). The
- *   "Today (live)" / "Pick a date" toggle swaps state.forecast between the live file
- *   loaded at boot and a lazily-fetched, cached archive date. Missing dates (some days
- *   in the archive may not exist) are handled with an inline message, not a crash.
+ *   meta.archive = { start_date, end_date, path_pattern } tells the page the bounds
+ *   and filename pattern of already-built per-date forecast files
+ *   (data/forecast_r{R}_{date}.json). Missing dates are handled with an inline
+ *   message, not a crash.
  */
 
 const JAKARTA_CENTER = [-6.2, 106.84];
 const state = {
   meta: null,
   forecast: null,
-  liveForecast: null, // the "today" forecast loaded at boot, kept so we can revert to it
+  climatology: null,
   resolution: 7,
   h3ToLayer: new Map(),
   geoLayer: null,
@@ -37,12 +34,13 @@ const state = {
   selectedLayer: null,
   locationMarker: null,
   chart: null,
-  currentSlot: null, // the diurnal clock slot nearest "now" (null for legacy flat data)
+  currentSlot: null, // retained for legacy flat data; historical views use all clock slots
   selected: null, // { h3id, lat, lng } of the chosen cell, so the clock tick can re-render it
   mode: "current", // "current" | "other"
-  dateMode: "live", // "live" | "archive"
-  archiveDate: null, // "YYYY-MM-DD" currently shown, when dateMode === "archive"
+  archiveDate: null, // "YYYY-MM-DD" currently shown
   archiveCache: new Map(), // date -> forecast object, or null if known-missing
+  climatologyCache: new Map(), // date -> climatology overlay object, or null if known-missing
+  simulationMode: "raw", // "raw" | "blend_climatology"
 };
 
 // Fallback if meta.json predates the archive feature; meta.archive (when present) wins.
@@ -52,9 +50,14 @@ const DEFAULT_ARCHIVE = {
   path_pattern: "data/forecast_r{res}_{date}.json",
 };
 
-const isPending = () => !state.meta || state.meta.model_status === "pending_retrain";
+const isPending = () => !state.meta || !state.forecast || state.meta.model_status === "pending_retrain";
 const cellsMap = () => (state.forecast && state.forecast.cells) || {};
 const show = (id, on) => document.getElementById(id).classList.toggle("hidden", !on);
+
+const DEFAULT_SIMULATION_MODES = [
+  { id: "raw", label: "Tanpa klimatologi", description: "Murni hasil model prediksi" },
+  { id: "blend_climatology", label: "Dengan klimatologi", description: "50% hasil model + 50% klimatologi ISPU." },
+];
 
 // ---------------------------------------------------------------------------
 // AQI scale helpers - driven entirely by meta.legend (single source of truth).
@@ -67,6 +70,23 @@ function legendEntryFor(value) {
   return legend[legend.length - 1];
 }
 const colorFor = (value) => legendEntryFor(value).color;
+const round1 = (value) => Math.round(Number(value) * 10) / 10;
+
+function modeInfo(id) {
+  const modes = (state.meta && state.meta.simulation_modes) || DEFAULT_SIMULATION_MODES;
+  return modes.find((m) => m.id === id) || { id, label: id, description: "" };
+}
+
+function classifyPoint(sourcePoint, value) {
+  const safe = Number.isFinite(Number(value)) ? Number(value) : 0;
+  const e = legendEntryFor(safe);
+  return {
+    ...sourcePoint,
+    value: round1(safe),
+    category: e.category,
+    colour: e.color,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Diurnal clock-slice: the forecast carries every fixed clock slot; the page
@@ -89,17 +109,38 @@ function nearestSlot(hour, slots) {
 }
 
 // The slot_hours that govern the CURRENTLY LOADED forecast (archive dates carry their
-// own slot_hours; fall back to meta for the live/default file or legacy data).
+// own slot_hours; fall back to meta for generated/default files or legacy data).
 const activeSlotHours = () => (state.forecast && state.forecast.slot_hours) || (state.meta && state.meta.slot_hours) || [];
 
 // The current-slot series for a cell. Accepts the slot-keyed shape
 // { slot_h: [series] } and the legacy flat [series] (returned as-is).
-function seriesForCell(h3id) {
+function diurnalSeriesForCell(h3id) {
   const cell = cellsMap()[h3id];
   if (!cell) return null;
   if (Array.isArray(cell)) return cell;                       // legacy flat (single anchor)
-  const slot = state.currentSlot != null ? state.currentSlot : nearestSlot(nowHourWIB());
-  return cell[String(slot)] || cell[Object.keys(cell)[0]] || null;
+  const slots = Object.keys(cell).map(Number).sort((a, b) => a - b);
+  const points = slots.map((slot) => {
+    const series = cell[String(slot)] || [];
+    const point = series.find((p) => Number(p.offset_h) === 0) || series[0];
+    if (!point) return null;
+    let out = { ...point, offset_h: 0, clock_h: slot };
+    if (state.simulationMode === "blend_climatology" && state.climatology) {
+      const climCell = state.climatology[h3id];
+      const climSeries = climCell && climCell[String(slot)];
+      const climValue = Array.isArray(climSeries) ? Number(climSeries[0]) : NaN;
+      if (Number.isFinite(climValue)) {
+        const weight = Number(state.meta.blend_weight ?? 0.5);
+        out = classifyPoint(out, (1 - weight) * Number(out.value) + weight * climValue);
+      }
+    }
+    return out;
+  }).filter(Boolean);
+  return points.length ? points : null;
+}
+
+function peakForSeries(series) {
+  if (!series || !series.length) return null;
+  return series.reduce((best, p) => (Number(p.value) > Number(best.value) ? p : best), series[0]);
 }
 
 // ---------------------------------------------------------------------------
@@ -124,10 +165,11 @@ function styleForFeature(feature) {
   if (isPending()) {
     return { fillColor: "#cdd6e0", fillOpacity: 0.22, color: "#8aa0b8", weight: 0.4 };
   }
-  const series = seriesForCell(feature.properties.h3_id);
-  const idx = series ? series[0].value : null;
+  const series = diurnalSeriesForCell(feature.properties.h3_id);
+  const peak = peakForSeries(series);
+  const idx = peak ? peak.value : null;
   return {
-    fillColor: idx === null ? state.meta.no_data_color : series[0].colour || colorFor(idx),
+    fillColor: idx === null ? state.meta.no_data_color : peak.colour || colorFor(idx),
     fillOpacity: 0.4,
     color: "#5b6573",
     weight: 0.3,
@@ -215,8 +257,8 @@ function selectByCell(h3id, lat, lng) {
   if (layer) state.map.panTo(layer.getBounds().getCenter());
 
   const coordTxt = lat != null ? `${lat.toFixed(4)}, ${lng.toFixed(4)}` : "";
-  const dateTxt = state.dateMode === "archive" && state.archiveDate
-    ? `<br>Archived date: ${state.archiveDate}`
+  const dateTxt = state.archiveDate
+    ? `<br>Historical date: ${state.archiveDate}`
     : "";
   document.getElementById("result-meta").innerHTML =
     `Cell <code>${h3id}</code>${coordTxt ? "<br>" + coordTxt : ""}${dateTxt}` +
@@ -226,20 +268,22 @@ function selectByCell(h3id, lat, lng) {
   if (isPending()) {
     show("aqi-readout", false);
     show("forecast-section", false);
+    show("peak-summary", false);
     show("aqi-pending", true);
     document.getElementById("pending-text").textContent = onGrid
-      ? state.meta.model_note
-      : "This location is outside the Jakarta mainland study grid, so it has no forecast cell.";
+      ? "Choose a historical date and press Show date to load the simulation for this cell."
+      : "This location is outside the Jakarta mainland study grid, so it has no simulated AQI.";
     if (state.chart) { state.chart.destroy(); state.chart = null; }
     return;
   }
 
-  // --- LIVE state ---
+  // --- Historical simulation state ---
   show("aqi-pending", false);
-  const series = seriesForCell(h3id);
+  const series = diurnalSeriesForCell(h3id);
   if (!series) {
     show("aqi-readout", true);
     show("forecast-section", false);
+    show("peak-summary", false);
     document.getElementById("aqi-value").textContent = "—";
     const badge = document.getElementById("aqi-badge");
     badge.textContent = "Outside coverage";
@@ -248,13 +292,15 @@ function selectByCell(h3id, lat, lng) {
     return;
   }
   show("aqi-readout", true);
+  show("peak-summary", true);
   show("forecast-section", true);
-  const now = series[0];
-  const e = legendEntryFor(now.value);
-  document.getElementById("aqi-value").textContent = Math.round(now.value);
+  const peak = peakForSeries(series);
+  const e = legendEntryFor(peak.value);
+  document.getElementById("aqi-value").textContent = Math.round(peak.value);
   const badge = document.getElementById("aqi-badge");
-  badge.textContent = `${now.category || e.category} · ${e.english}`;
-  badge.style.background = now.colour || e.color;
+  badge.textContent = `${peak.category || e.category} · ${e.english}`;
+  badge.style.background = peak.colour || e.color;
+  renderPeakSummary(peak);
   renderChart(series);
   renderStepBadges(series);
 }
@@ -277,16 +323,31 @@ function stepClock(offsetH) {
   return "";
 }
 
+function pointClock(point) {
+  if (point && point.clock_h != null) return pad2(point.clock_h) + ":00";
+  return stepClock(point ? point.offset_h : 0);
+}
+
+function renderPeakSummary(peak) {
+  const el = document.getElementById("peak-summary");
+  const e = legendEntryFor(peak.value);
+  const clk = pointClock(peak);
+  el.innerHTML =
+    `<strong>Peak AQI</strong> <span class="peak-time">${clk} WIB</span>` +
+    ` &middot; ${Math.round(peak.value)} &middot; ${peak.category || e.category} (${e.english})`;
+}
+
 function renderChart(series) {
   // Heading reflects the actual step size + horizon span from the data (not hardcoded).
-  const step = series.length > 1 ? series[1].offset_h - series[0].offset_h : 0;
-  const span = series.length ? series[series.length - 1].offset_h : 0;
+  const step = series.length > 1 && series[1].clock_h != null
+    ? (series[1].clock_h - series[0].clock_h + 24) % 24
+    : (series.length > 1 ? series[1].offset_h - series[0].offset_h : 0);
   const titleEl = document.getElementById("chart-title");
-  if (titleEl) titleEl.textContent = step ? `Next ${span} hours · ${step}-hour steps` : "Forecast";
+  if (titleEl) titleEl.textContent = step ? `Historical diurnal pattern · ${step}-hour slots` : "Historical pattern";
 
   const labels = series.map((s) => {
-    const clk = stepClock(s.offset_h);
-    return clk ? `${stepLabel(s.offset_h)}\n${clk}` : stepLabel(s.offset_h);
+    const clk = pointClock(s);
+    return clk ? clk : stepLabel(s.offset_h);
   });
   const values = series.map((s) => s.value);
   const colors = series.map((s) => s.colour || colorFor(s.value));
@@ -309,6 +370,9 @@ function renderChart(series) {
       }],
     },
     options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      layout: { padding: { left: 0, right: 4, top: 4, bottom: 0 } },
       plugins: {
         legend: { display: false },
         tooltip: {
@@ -321,8 +385,16 @@ function renderChart(series) {
         },
       },
       scales: {
-        y: { beginAtZero: true, suggestedMax: 150, title: { display: true, text: "ISPU index" } },
-        x: { ticks: { maxRotation: 0, autoSkip: false } },
+        y: {
+          beginAtZero: true,
+          suggestedMax: 150,
+          title: { display: true, text: "ISPU", font: { size: 10 } },
+          ticks: { font: { size: 10 }, padding: 2, maxTicksLimit: 5 },
+        },
+        x: {
+          ticks: { maxRotation: 0, autoSkip: false, font: { size: 10 }, padding: 2 },
+          title: { display: true, text: "WIB", font: { size: 10 }, padding: { top: 0 } },
+        },
       },
     },
   });
@@ -333,11 +405,11 @@ function renderStepBadges(series) {
   wrap.innerHTML = "";
   series.forEach((s) => {
     const e = legendEntryFor(s.value);
-    const clk = stepClock(s.offset_h);
+    const clk = pointClock(s);
     const div = document.createElement("div");
     div.className = "sb";
     div.innerHTML =
-      `<div class="sb-time">${stepLabel(s.offset_h)}${clk ? " · " + clk : ""}</div>` +
+      `<div class="sb-time">${clk ? clk + " WIB" : stepLabel(s.offset_h)}</div>` +
       `<div class="sb-val">${Math.round(s.value)}</div>` +
       `<div><span class="dot" style="background:${s.colour || e.color}"></span>${s.category || e.category}</div>`;
     wrap.appendChild(div);
@@ -356,7 +428,7 @@ function renderLegend() {
     const range = e.upper === null ? `${lower}+` : `${lower}–${e.upper}`;
     li.innerHTML =
       `<span class="swatch" style="background:${e.color}"></span>` +
-      `<span>${e.category} <em>(${e.english})</em></span>` +
+      `<span class="legend-label"><span class="legend-id">${e.category}</span><span class="legend-en">${e.english}</span></span>` +
       `<span class="range">${range}</span>`;
     ul.appendChild(li);
     lower = (e.upper ?? lower) + 1;
@@ -365,39 +437,40 @@ function renderLegend() {
 
 function renderBanner() {
   const b = document.getElementById("status-banner");
+  if (b.classList.contains("is-empty")) {
+    b.textContent = "";
+    return;
+  }
   if (isPending()) {
     b.className = "banner banner-pending";
-    b.innerHTML = `<strong>PREVIEW</strong> &mdash; ${state.meta.model_note}`;
+    b.innerHTML = `<strong>SELECT DATE</strong> &mdash; choose a historical date, then press Show date to load the simulation`;
   } else {
-    b.className = "banner banner-live";
-    if (state.dateMode === "archive" && state.archiveDate) {
-      // Archived date: the diurnal SHAPE still follows the live WIB clock (the slot
-      // nearest "now"), but the underlying day is the picked archive date, not today.
-      const clk = state.currentSlot != null ? ` &middot; ${wibClockStr()} WIB` : "";
-      b.innerHTML =
-        `<strong>ARCHIVE</strong> &middot; modeled diurnal pattern for ${state.archiveDate}${clk} ` +
-        `&middot; representative day, not a live measurement`;
-    } else if (state.currentSlot != null) {
-      // Driven by the current WIB clock: today's date + live WIB time. The values are
-      // a modeled representative diurnal pattern, so we label it honestly (not "live").
-      b.innerHTML =
-        `Modeled diurnal pattern &middot; ${wibDateStr()} ${wibClockStr()} WIB ` +
-        `&middot; representative day, not a live measurement`;
-    } else {
-      const anchorTxt = state.meta.anchor_ts || state.meta.anchor_date || "—";
-      b.innerHTML = `Modeled forecast &middot; anchor ${anchorTxt} (WIB)`;
-    }
+    b.className = "banner banner-sim";
+    b.innerHTML =
+      `<strong>HISTORICAL SIMULATION</strong> &middot; modeled diurnal pattern for ${state.archiveDate || "selected date"} ` +
+      `&middot; ${modeInfo(state.simulationMode).label} ` +
+      `&middot; not a live measurement`;
   }
 }
 
 function renderAbout() {
   document.getElementById("about-disclaimers").innerHTML =
     state.meta.disclaimers.map((d) => `<li>${d}</li>`).join("");
-  const tail = isPending()
-    ? "forecast pending re-train"
-    : `${state.meta.n_forecast_cells} cells forecast`;
-  document.getElementById("footer-note").textContent =
-    `${state.meta.n_cells} hex cells · resolution r${state.resolution} · ${tail}`;
+  const footer = document.getElementById("footer-note");
+  if (footer) footer.textContent = "";
+}
+
+function renderSimulationControls() {
+  const raw = modeInfo("raw");
+  const blend = modeInfo("blend_climatology");
+  const rawBtn = document.getElementById("sim-raw");
+  const blendBtn = document.getElementById("sim-blend");
+  rawBtn.textContent = raw.label || "Tanpa klimatologi";
+  blendBtn.textContent = blend.label || "Dengan klimatologi";
+  rawBtn.classList.toggle("active", state.simulationMode === "raw");
+  blendBtn.classList.toggle("active", state.simulationMode === "blend_climatology");
+  const active = modeInfo(state.simulationMode);
+  document.getElementById("simulation-note").textContent = active.description || "";
 }
 
 function setMode(mode) {
@@ -408,31 +481,17 @@ function setMode(mode) {
   show("panel-other", mode === "other");
 }
 
-// Re-evaluate the WIB clock on a timer: keep the banner's "now" current, and when the
-// nearest slot rolls over (every few hours) recolor the grid + re-render the selected
-// cell, so the map follows the time of day on its own without a reload.
-function tickClock() {
-  if (isPending()) return;
-  const slots = activeSlotHours();
-  if (!slots.length) return;
-  const s = nearestSlot(nowHourWIB(), slots);
-  const slotChanged = s !== state.currentSlot;
-  state.currentSlot = s;
-  renderBanner();
-  if (slotChanged) {
-    if (state.geoLayer) state.geoLayer.setStyle(styleForFeature); // hexes follow the new slot
-    if (state.selected) selectByCell(state.selected.h3id, state.selected.lat, state.selected.lng);
-  }
-}
-
 // ---------------------------------------------------------------------------
-// Date picker (archive): swap state.forecast between the live "today" file and
-// an already-built per-date file from the archive. Lazily fetched + cached;
-// missing dates degrade to an inline message, never a crash.
+// Date picker (archive): load an already-built per-date file from the archive.
+// Lazily fetched + cached; missing dates degrade to an inline message.
 // ---------------------------------------------------------------------------
 const archiveConfig = () => (state.meta && state.meta.archive) || DEFAULT_ARCHIVE;
 const archivePath = (dateStr) =>
   archiveConfig().path_pattern.replace("{res}", state.resolution).replace("{date}", dateStr);
+const climatologyPath = (dateStr) => {
+  const pattern = (state.meta && state.meta.climatology_file_pattern) || "climatology_r7_{date}.json";
+  return pattern ? `data/${pattern.replace("{date}", dateStr)}` : null;
+};
 
 // The backtest pipeline that produces the archive files (data/forecast_r{res}_{date}.json)
 // sometimes emits the BARE cell map at the top level -- { h3_id: { slot_h: [series] } } --
@@ -447,7 +506,7 @@ function normalizeArchiveForecast(raw, dateStr) {
   const slot_hours = Object.keys(firstCell).map(Number).sort((a, b) => a - b);
   const firstSlot = firstCell[Object.keys(firstCell)[0]] || [];
   const horizons_h = firstSlot.map((p) => p.offset_h);
-  return { model_status: "live", anchor_date: dateStr, slot_hours, horizons_h, cells };
+  return { model_status: "historical", anchor_date: dateStr, slot_hours, horizons_h, cells };
 }
 
 async function loadArchiveDate(dateStr) {
@@ -466,51 +525,170 @@ async function loadArchiveDate(dateStr) {
   }
 }
 
+async function loadClimatologyDate(dateStr) {
+  if (!dateStr) return null;
+  const cache = state.climatologyCache;
+  if (cache.has(dateStr)) return cache.get(dateStr);
+  const path = climatologyPath(dateStr);
+  if (!path) return null;
+  try {
+    const res = await fetch(path);
+    if (!res.ok) return null;
+    const raw = await res.json();
+    const data = raw && raw.cells ? raw.cells : raw;
+    cache.set(dateStr, data);
+    return data;
+  } catch (e) {
+    return null;
+  }
+}
+
 // Re-derive everything that depends on "which forecast is loaded": the clock slot,
 // the grid colouring, the banner, and the currently-selected cell's readout.
 function refreshAfterForecastChange() {
-  const slots = activeSlotHours();
-  state.currentSlot = slots.length ? nearestSlot(nowHourWIB(), slots) : null;
+  state.currentSlot = null;
   if (state.geoLayer) state.geoLayer.setStyle(styleForFeature);
+  renderSimulationControls();
   renderBanner();
   if (state.selected) selectByCell(state.selected.h3id, state.selected.lat, state.selected.lng);
 }
 
 async function onArchiveDateChange(dateStr) {
-  state.archiveDate = dateStr;
   const hint = document.getElementById("date-hint");
   hint.classList.remove("warn");
   hint.textContent = "Loading…";
   const data = await loadArchiveDate(dateStr);
   if (!data) {
-    hint.textContent = `No forecast saved for ${dateStr} — try a nearby date.`;
+    hint.textContent = `No simulation saved for ${dateStr} — try a nearby date.`;
     hint.classList.add("warn");
     return; // keep showing whatever was loaded before (don't blank the map on a miss)
   }
   state.forecast = data;
-  hint.textContent = `Showing the modeled climatology for ${dateStr}.`;
+  state.archiveDate = dateStr;
+  let statusText = `Showing the historical simulation for ${dateStr}.`;
+  let statusWarn = false;
+  if (state.simulationMode === "blend_climatology") {
+    const clim = await loadClimatologyDate(dateStr);
+    if (!clim) {
+      state.simulationMode = "raw";
+      state.climatology = null;
+      statusText = `Showing ${dateStr}; climatology overlay missing, so simulation without climatology is used.`;
+      statusWarn = true;
+    } else {
+      state.climatology = clim;
+    }
+  } else {
+    state.climatology = null;
+  }
+  hint.textContent = statusText;
+  hint.classList.toggle("warn", statusWarn);
+  renderAbout();
   refreshAfterForecastChange();
 }
 
-function setDateMode(mode) {
-  state.dateMode = mode;
-  document.getElementById("date-mode-live").classList.toggle("active", mode === "live");
-  document.getElementById("date-mode-archive").classList.toggle("active", mode === "archive");
-  show("panel-date-live", mode === "live");
-  show("panel-date-archive", mode === "archive");
-  if (mode === "live") {
-    state.forecast = state.liveForecast;
-    refreshAfterForecastChange();
-  } else {
-    const input = document.getElementById("date-input");
-    if (input.value) onArchiveDateChange(input.value);
+function confirmArchiveDate() {
+  const input = document.getElementById("date-input");
+  const hint = document.getElementById("date-hint");
+  if (!input.value) {
+    hint.textContent = "Choose a date first.";
+    hint.classList.add("warn");
+    return;
+  }
+  onArchiveDateChange(input.value);
+}
+
+// ---------------------------------------------------------------------------
+// LandingHero controller - a thin entry layer over the existing map app.
+// ---------------------------------------------------------------------------
+function openAboutOverlay() {
+  const overlay = document.getElementById("about-overlay");
+  if (overlay) overlay.classList.remove("hidden");
+}
+
+function closeAboutOverlay() {
+  const overlay = document.getElementById("about-overlay");
+  if (overlay) overlay.classList.add("hidden");
+}
+
+function showLanding() {
+  document.body.classList.add("landing-open");
+  const landing = document.getElementById("landing");
+  if (landing) landing.removeAttribute("aria-hidden");
+}
+
+function enterApp(options = {}) {
+  document.body.classList.remove("landing-open");
+  const landing = document.getElementById("landing");
+  if (landing) landing.setAttribute("aria-hidden", "true");
+  if (document.getElementById("layout").classList.contains("sidebar-collapsed")) {
+    setSidebarCollapsed(false);
+  }
+  if (options.focusDate !== false) {
+    window.setTimeout(() => {
+      const dateInput = document.getElementById("date-input");
+      if (dateInput) dateInput.focus({ preventScroll: true });
+    }, 220);
   }
 }
 
+function renderLandingDashboard() {
+  if (!state.meta) return;
+  const arc = archiveConfig();
+  const slotText = activeSlotHours().map((h) => pad2(h)).join(", ");
+  document.getElementById("landing-archive-range").textContent = `${arc.start_date} to ${arc.end_date}`;
+  document.getElementById("landing-cell-count").textContent = `${state.meta.n_cells} H3 cells`;
+  document.getElementById("landing-slot-list").textContent = `${slotText} WIB`;
+  document.getElementById("landing-mode-label").textContent = modeInfo(state.simulationMode).label;
+
+  const strip = document.getElementById("landing-scale-strip");
+  strip.innerHTML = "";
+  state.meta.legend.forEach((entry) => {
+    const segment = document.createElement("span");
+    segment.title = `${entry.category} (${entry.english})`;
+    segment.style.background = entry.color;
+    strip.appendChild(segment);
+  });
+}
+
+async function startLandingWithDate(dateStr) {
+  const input = document.getElementById("date-input");
+  if (input) input.value = dateStr;
+  await onArchiveDateChange(dateStr);
+  enterApp({ focusDate: false });
+}
+
+function wireLandingControls() {
+  const start = document.getElementById("landing-start");
+  const notes = document.getElementById("landing-about");
+  const intro = document.getElementById("intro-btn");
+  const firstDate = document.getElementById("landing-first-date");
+  const latestDate = document.getElementById("landing-latest-date");
+  const manualDate = document.getElementById("landing-manual-date");
+  if (start) start.addEventListener("click", enterApp);
+  if (notes) notes.addEventListener("click", openAboutOverlay);
+  if (intro) intro.addEventListener("click", showLanding);
+  if (firstDate) firstDate.addEventListener("click", () => startLandingWithDate(archiveConfig().start_date));
+  if (latestDate) latestDate.addEventListener("click", () => startLandingWithDate(archiveConfig().end_date));
+  if (manualDate) manualDate.addEventListener("click", enterApp);
+}
+
 function wireControls() {
-  document.getElementById("date-mode-live").addEventListener("click", () => setDateMode("live"));
-  document.getElementById("date-mode-archive").addEventListener("click", () => setDateMode("archive"));
-  document.getElementById("date-input").addEventListener("change", (e) => onArchiveDateChange(e.target.value));
+  wireLandingControls();
+  wireSidebarToggle();
+  document.getElementById("date-confirm-btn").addEventListener("click", confirmArchiveDate);
+  document.getElementById("sim-raw").addEventListener("click", () => setSimulationMode("raw"));
+  document.getElementById("sim-blend").addEventListener("click", () => setSimulationMode("blend_climatology"));
+  document.getElementById("date-input").addEventListener("change", (e) => {
+    const hint = document.getElementById("date-hint");
+    hint.classList.remove("warn");
+    hint.textContent = `Selected ${e.target.value}. Press Show date to load the historical simulation.`;
+  });
+  document.getElementById("date-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      confirmArchiveDate();
+    }
+  });
 
   document.getElementById("mode-current").addEventListener("click", () => setMode("current"));
   document.getElementById("mode-other").addEventListener("click", () => setMode("other"));
@@ -570,9 +748,52 @@ function wireControls() {
 
   // About overlay
   const overlay = document.getElementById("about-overlay");
-  document.getElementById("about-btn").addEventListener("click", () => overlay.classList.remove("hidden"));
-  document.getElementById("about-close").addEventListener("click", () => overlay.classList.add("hidden"));
-  overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.classList.add("hidden"); });
+  const aboutBtn = document.getElementById("about-btn");
+  if (aboutBtn) aboutBtn.addEventListener("click", openAboutOverlay);
+  document.getElementById("about-close").addEventListener("click", closeAboutOverlay);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) closeAboutOverlay(); });
+}
+
+async function setSimulationMode(mode) {
+  if (mode === state.simulationMode) return;
+  if (mode === "blend_climatology" && state.archiveDate) {
+    const clim = await loadClimatologyDate(state.archiveDate);
+    if (!clim) {
+      alert("Climatology overlay is not available for this date.");
+      return;
+    }
+    state.climatology = clim;
+  }
+  if (mode === "raw") state.climatology = null;
+  state.simulationMode = mode;
+  renderSimulationControls();
+  renderLandingDashboard();
+  refreshAfterForecastChange();
+}
+
+function setSidebarCollapsed(collapsed) {
+  const layout = document.getElementById("layout");
+  const sidebar = document.getElementById("sidebar");
+  const toggle = document.getElementById("sidebar-toggle");
+  layout.classList.toggle("sidebar-collapsed", collapsed);
+  toggle.setAttribute("aria-expanded", String(!collapsed));
+  toggle.setAttribute("aria-label", collapsed ? "Expand side panel" : "Collapse side panel");
+  toggle.title = collapsed ? "Expand side panel" : "Collapse side panel";
+  sidebar.setAttribute("aria-hidden", String(collapsed));
+  sidebar.inert = collapsed;
+  if (collapsed && sidebar.contains(document.activeElement)) toggle.focus();
+  requestAnimationFrame(() => state.map && state.map.invalidateSize());
+  window.setTimeout(() => state.map && state.map.invalidateSize(), 260);
+}
+
+function wireSidebarToggle() {
+  const toggle = document.getElementById("sidebar-toggle");
+  if (!toggle) return;
+  setSidebarCollapsed(false);
+  toggle.addEventListener("click", () => {
+    const collapsed = document.getElementById("layout").classList.contains("sidebar-collapsed");
+    setSidebarCollapsed(!collapsed);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -580,26 +801,24 @@ function wireControls() {
 // ---------------------------------------------------------------------------
 async function boot() {
   // meta first (it carries the resolution that names the other two files)
-  const meta = await fetch("data/meta.json").then((r) => r.json());
+  const meta = await fetch("data/meta.json?v=simulation-mode-retry-2", { cache: "no-store" }).then((r) => r.json());
   state.meta = meta;
   state.resolution = meta.resolution;
+  state.simulationMode = meta.default_simulation_mode || "raw";
 
-  const [forecast, geojson] = await Promise.all([
-    fetch(`data/forecast_r${meta.resolution}.json`).then((r) => r.json()),
-    fetch(`data/hexes_r${meta.resolution}.geojson`).then((r) => r.json()),
-  ]);
-  state.forecast = forecast;
-  state.liveForecast = forecast; // keep a handle so "Today (live)" can revert to it
-  state.currentSlot = (meta.slot_hours && meta.slot_hours.length) ? nearestSlot(nowHourWIB()) : null;
-  document.getElementById("res-label").textContent = "r" + meta.resolution;
+  const geojson = await fetch(`data/hexes_r${meta.resolution}.geojson`).then((r) => r.json());
+  state.forecast = null;
+  state.currentSlot = null;
+  const resLabel = document.getElementById("res-label");
+  if (resLabel) resLabel.textContent = "r" + meta.resolution;
 
   const arc = archiveConfig();
   const dateInput = document.getElementById("date-input");
   dateInput.min = arc.start_date;
   dateInput.max = arc.end_date;
-  dateInput.value = arc.end_date; // default to the most recent archived date
-  document.getElementById("live-date-hint").textContent =
-    `Showing today's live modeled forecast. Archive available ${arc.start_date} → ${arc.end_date}.`;
+  dateInput.value = "";
+  document.getElementById("date-hint").textContent =
+    `Available historical dates: ${arc.start_date} to ${arc.end_date}.`;
 
   initMap();
   addGeoLayer(geojson);
@@ -607,9 +826,10 @@ async function boot() {
   renderLegend();
   renderBanner();
   renderAbout();
+  renderSimulationControls();
+  renderLandingDashboard();
   wireControls();
   setMode("current");
-  setInterval(tickClock, 60 * 1000); // follow the WIB clock without a reload
 }
 
 boot().catch((e) => {
